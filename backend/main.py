@@ -25,6 +25,107 @@ REGION_COORDINATES = {
 }
 
 
+STRESS_RANGES = {
+    "Soil_Moisture": {"min": 8.0, "max": 65.0},
+    "Temperature_C": {"min": 12.0, "max": 42.0},
+    "Humidity": {"min": 25.0, "max": 95.0},
+    "Rainfall_mm": {"min": 0.38, "max": 2499.69},
+    "Sunlight_Hours": {"min": 4.0, "max": 11.0},
+    "Wind_Speed_kmh": {"min": 0.5, "max": 20.0},
+    "Electrical_Conductivity": {"min": 0.1, "max": 3.5},
+    "Previous_Irrigation_mm": {"min": 0.02, "max": 119.99},
+}
+
+
+def normalize_value(value: float, column_name: str):
+    col_min = STRESS_RANGES[column_name]["min"]
+    col_max = STRESS_RANGES[column_name]["max"]
+
+    if col_max == col_min:
+        return 0
+
+    normalized = (value - col_min) / (col_max - col_min)
+
+    return max(0, min(normalized, 1))
+
+
+
+def calculate_stress_index(
+    soil_moisture: float,
+    temperature_c: float,
+    humidity: float,
+    rainfall_mm: float,
+    sunlight_hours: float,
+    wind_speed_kmh: float,
+    electrical_conductivity: float,
+    previous_irrigation_mm: float,
+    soil_type: str,
+    crop_type: str,
+    crop_growth_stage: str,
+    mulching_used: str
+):
+    soil_dryness = 1 - normalize_value(soil_moisture, "Soil_Moisture")
+    high_temperature = normalize_value(temperature_c, "Temperature_C")
+    low_humidity = 1 - normalize_value(humidity, "Humidity")
+    low_rainfall = 1 - normalize_value(rainfall_mm, "Rainfall_mm")
+    high_sunlight = normalize_value(sunlight_hours, "Sunlight_Hours")
+    high_wind = normalize_value(wind_speed_kmh, "Wind_Speed_kmh")
+    high_ec = normalize_value(electrical_conductivity, "Electrical_Conductivity")
+    low_previous_irrigation = 1 - normalize_value(previous_irrigation_mm, "Previous_Irrigation_mm")
+
+    soil_weight = {
+        "Sandy": 1.00,
+        "Loamy": 0.55,
+        "Silt": 0.45,
+        "Clay": 0.30
+    }.get(soil_type, 0.50)
+
+    stage_weight = {
+        "Sowing": 0.75,
+        "Vegetative": 1.00,
+        "Flowering": 0.90,
+        "Harvest": 0.45
+    }.get(crop_growth_stage, 0.60)
+
+    crop_weight = {
+        "Rice": 1.00,
+        "Sugarcane": 0.95,
+        "Cotton": 0.85,
+        "Maize": 0.75,
+        "Wheat": 0.65,
+        "Soybean": 0.60
+    }.get(crop_type, 0.70)
+
+    mulch_factor = {
+        "Yes": 0.85,
+        "No": 1.00
+    }.get(mulching_used, 1.00)
+
+    base_stress = (
+        0.30 * soil_dryness +
+        0.15 * high_temperature +
+        0.12 * low_humidity +
+        0.15 * low_rainfall +
+        0.08 * high_sunlight +
+        0.05 * high_wind +
+        0.05 * high_ec +
+        0.05 * low_previous_irrigation +
+        0.05 * soil_weight
+    )
+
+    stress_index = (
+        base_stress
+        * (0.80 + 0.20 * crop_weight)
+        * (0.85 + 0.15 * stage_weight)
+        * mulch_factor
+        * 100
+    )
+
+    stress_index = max(0, min(stress_index, 100))
+
+    return round(stress_index, 2)
+
+
 class IrrigationInput(BaseModel):
     Soil_Type: str
     Soil_pH: float
@@ -59,7 +160,7 @@ class IrrigationWithWeatherInput(BaseModel):
     Previous_Irrigation_mm: float
     Region: str
 
-    Stress_Index: float
+    
 
 
 
@@ -140,6 +241,22 @@ def predict_with_weather(data: IrrigationWithWeatherInput):
         latitude=coordinates["latitude"],
         longitude=coordinates["longitude"]
     )
+     
+
+    stress_index = calculate_stress_index(
+       soil_moisture=data.Soil_Moisture,
+       temperature_c=weather_data["Temperature_C"],
+       humidity=weather_data["Humidity"],
+       rainfall_mm=weather_data["Rainfall_mm"],
+       sunlight_hours=weather_data["Sunlight_Hours"],
+       wind_speed_kmh=weather_data["Wind_Speed_kmh"],
+       electrical_conductivity=data.Electrical_Conductivity,
+       previous_irrigation_mm=data.Previous_Irrigation_mm,
+       soil_type=data.Soil_Type,
+      crop_type=data.Crop_Type,
+       crop_growth_stage=data.Crop_Growth_Stage,
+       mulching_used=data.Mulching_Used
+    )
 
     input_data = {
         "Soil_Type": data.Soil_Type,
@@ -160,7 +277,7 @@ def predict_with_weather(data: IrrigationWithWeatherInput):
         "Mulching_Used": data.Mulching_Used,
         "Previous_Irrigation_mm": data.Previous_Irrigation_mm,
         "Region": data.Region,
-        "Stress_Index": data.Stress_Index
+        "Stress_Index": stress_index
     }
 
     input_df = pd.DataFrame([input_data])
@@ -172,6 +289,7 @@ def predict_with_weather(data: IrrigationWithWeatherInput):
         "region": data.Region,
         "coordinates_used": coordinates,
         "weather_data_used": weather_data,
+        "calculated_stress_index": stress_index,
         "Soil_Moisture_J1_prediction": round(float(prediction), 2),
         "unit": "%",
         "message": "Prédiction effectuée avec les données météo Open-Meteo."
