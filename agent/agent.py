@@ -1,7 +1,8 @@
-import requests 
+import requests
 
 # Lien de l'API FastAPI
 API_URL = "http://127.0.0.1:8000/predict-with-weather"
+
 
 def get_prediction_from_api(field_data):
     """
@@ -9,19 +10,25 @@ def get_prediction_from_api(field_data):
     et récupère la prédiction du modèle ML.
     """
 
-    response = requests.post(API_URL, json=field_data)
+    try:
+        response = requests.post(API_URL, json=field_data)
 
-    if response.status_code != 200:
+        if response.status_code != 200:
+            return {
+                "success": False,
+                "error": response.text
+            }
+
         return {
-            "success": False,
-            "error": response.text
+            "success": True,
+            "data": response.json()
         }
 
-    return {
-        "success": True,
-        "data": response.json()
-    }
-
+    except requests.exceptions.ConnectionError:
+        return {
+            "success": False,
+            "error": "Impossible de se connecter à l'API. Vérifie que FastAPI est bien démarrée."
+        }
 
 
 def make_irrigation_decision(predicted_soil_moisture):
@@ -30,6 +37,7 @@ def make_irrigation_decision(predicted_soil_moisture):
     et donne une décision d'irrigation.
 
     La décision est basée sur Soil_Moisture_J1_prediction.
+    Les seuils utilisés sont heuristiques pour une première version du prototype.
     """
 
     if predicted_soil_moisture < 20:
@@ -54,7 +62,41 @@ def make_irrigation_decision(predicted_soil_moisture):
         }
 
 
-def generate_advice(api_result, decision_result):
+def estimate_irrigation_level(predicted_soil_moisture):
+    """
+    Cette fonction estime le niveau général d'irrigation
+    à partir de l'humidité du sol prévue pour demain.
+
+    Il s'agit d'une recommandation qualitative pour le prototype,
+    pas d'un calcul exact de volume d'eau.
+    """
+
+    if predicted_soil_moisture < 15:
+        return {
+            "irrigation_level": "Forte",
+            "explanation": "Le déficit d'humidité prévu est important."
+        }
+
+    elif predicted_soil_moisture < 25:
+        return {
+            "irrigation_level": "Modérée",
+            "explanation": "Le déficit d'humidité prévu est moyen."
+        }
+
+    elif predicted_soil_moisture < 35:
+        return {
+            "irrigation_level": "Légère",
+            "explanation": "Le déficit d'humidité prévu est faible."
+        }
+
+    else:
+        return {
+            "irrigation_level": "Aucune",
+            "explanation": "L'humidité prévue est suffisante."
+        }
+
+
+def generate_advice(api_result, decision_result, irrigation_level_result):
     """
     Cette fonction transforme les résultats techniques en message simple
     pour l'agriculteur.
@@ -73,8 +115,11 @@ Décision : {decision_result["decision"]}
 
 Niveau de risque : {decision_result["risk_level"]}
 
+Niveau d'irrigation : {irrigation_level_result["irrigation_level"]}
+
 Explication :
 {decision_result["reason"]}
+{irrigation_level_result["explanation"]}
 
 Résultat principal du modèle :
 - Humidité du sol prévue demain : {predicted_soil_moisture} %
@@ -88,6 +133,7 @@ Informations contextuelles :
 
 Remarque :
 La décision d'irrigation est basée principalement sur l'humidité du sol prévue.
+Le niveau d'irrigation proposé est qualitatif pour cette version du prototype.
 Les données météo et l'indice de stress sont affichés pour expliquer le contexte.
 """
 
@@ -125,8 +171,11 @@ if __name__ == "__main__":
         # 4. Prendre la décision à partir de la prédiction
         decision = make_irrigation_decision(predicted_soil_moisture)
 
-        # 5. Générer un message clair
-        advice = generate_advice(api_data, decision)
+        # 5. Estimer le niveau qualitatif d'irrigation
+        irrigation_level = estimate_irrigation_level(predicted_soil_moisture)
+
+        # 6. Générer un message clair
+        advice = generate_advice(api_data, decision, irrigation_level)
 
         print(advice)
 
