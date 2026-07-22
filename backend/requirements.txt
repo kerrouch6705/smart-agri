@@ -9,3 +9,4 @@ langchain
 python-dotenv
 langchain-groq
 langgraph
+streamlit

@@ -1,131 +1,60 @@
+"""
+backend/main.py
+
+API FastAPI de Smart-Agri.
+
+MODIFICATIONS APPORTEES PAR RAPPORT A LA VERSION ORIGINALE :
+--------------------------------------------------------------
+1. Toute la logique (chargement du modele, meteo Open-Meteo, calcul du
+   stress hydrique, prediction) a ete deplacee dans core/prediction_service.py
+   pour etre partagee avec l'agent LangGraph, sans duplication de code et
+   sans que le backend ait besoin de s'appeler lui-meme par HTTP.
+2. Un nouvel endpoint POST /analyze a ete ajoute : il execute le workflow
+   complet LangGraph (prediction ML + analyse meteo + analyse agronomique +
+   decision + recommandation Groq) et retourne un resultat structure.
+   C'est cet endpoint que le frontend Streamlit appelle pour "Nouvelle analyse".
+3. Le chemin et le nom du modele (models/rf_pipeline.pkl) n'ont PAS ete
+   modifies.
+"""
+
+import os
+import sys
+
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
-import joblib
-import os
-import requests 
+
+# On ajoute la racine du projet (le dossier parent de backend/) au chemin
+# Python. Cela permet d'importer "core" et "agent", qui sont des dossiers
+# freres de "backend", peu importe le dossier depuis lequel uvicorn est lance.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from core.prediction_service import run_prediction_with_weather, pipeline  # noqa: E402
+
 
 app = FastAPI(
     title="Smart-Agri API",
-    description="API de prédiction de l'humidité du sol au jour suivant",
-    version="1.0"
+    description="API de prediction de l'humidite du sol et de recommandation d'irrigation",
+    version="1.1",
+)
+
+# CORS ouvert : utile pour que le frontend Streamlit (autre port) puisse
+# appeler l'API sans etre bloque par le navigateur.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
-MODEL_PATH = os.path.join("..", "models", "rf_pipeline.pkl")
-
-pipeline = joblib.load(MODEL_PATH)
-
-REGION_COORDINATES = {
-    "Souss-Massa": {"latitude": 30.4278, "longitude": -9.5981},
-    "Agadir": {"latitude": 30.4278, "longitude": -9.5981},
-    "Taroudant": {"latitude": 30.4703, "longitude": -8.8769},
-    "Marrakech": {"latitude": 31.6295, "longitude": -7.9811},
-    "Casablanca": {"latitude": 33.5731, "longitude": -7.5898}
-}
-
-
-STRESS_RANGES = {
-    "Soil_Moisture": {"min": 8.0, "max": 65.0},
-    "Temperature_C": {"min": 12.0, "max": 42.0},
-    "Humidity": {"min": 25.0, "max": 95.0},
-    "Rainfall_mm": {"min": 0.38, "max": 2499.69},
-    "Sunlight_Hours": {"min": 4.0, "max": 11.0},
-    "Wind_Speed_kmh": {"min": 0.5, "max": 20.0},
-    "Electrical_Conductivity": {"min": 0.1, "max": 3.5},
-    "Previous_Irrigation_mm": {"min": 0.02, "max": 119.99},
-}
-
-
-def normalize_value(value: float, column_name: str):
-    col_min = STRESS_RANGES[column_name]["min"]
-    col_max = STRESS_RANGES[column_name]["max"]
-
-    if col_max == col_min:
-        return 0
-
-    normalized = (value - col_min) / (col_max - col_min)
-
-    return max(0, min(normalized, 1))
-
-
-
-def calculate_stress_index(
-    soil_moisture: float,
-    temperature_c: float,
-    humidity: float,
-    rainfall_mm: float,
-    sunlight_hours: float,
-    wind_speed_kmh: float,
-    electrical_conductivity: float,
-    previous_irrigation_mm: float,
-    soil_type: str,
-    crop_type: str,
-    crop_growth_stage: str,
-    mulching_used: str
-):
-    soil_dryness = 1 - normalize_value(soil_moisture, "Soil_Moisture")
-    high_temperature = normalize_value(temperature_c, "Temperature_C")
-    low_humidity = 1 - normalize_value(humidity, "Humidity")
-    low_rainfall = 1 - normalize_value(rainfall_mm, "Rainfall_mm")
-    high_sunlight = normalize_value(sunlight_hours, "Sunlight_Hours")
-    high_wind = normalize_value(wind_speed_kmh, "Wind_Speed_kmh")
-    high_ec = normalize_value(electrical_conductivity, "Electrical_Conductivity")
-    low_previous_irrigation = 1 - normalize_value(previous_irrigation_mm, "Previous_Irrigation_mm")
-
-    soil_weight = {
-        "Sandy": 1.00,
-        "Loamy": 0.55,
-        "Silt": 0.45,
-        "Clay": 0.30
-    }.get(soil_type, 0.50)
-
-    stage_weight = {
-        "Sowing": 0.75,
-        "Vegetative": 1.00,
-        "Flowering": 0.90,
-        "Harvest": 0.45
-    }.get(crop_growth_stage, 0.60)
-
-    crop_weight = {
-        "Rice": 1.00,
-        "Sugarcane": 0.95,
-        "Cotton": 0.85,
-        "Maize": 0.75,
-        "Wheat": 0.65,
-        "Soybean": 0.60
-    }.get(crop_type, 0.70)
-
-    mulch_factor = {
-        "Yes": 0.85,
-        "No": 1.00
-    }.get(mulching_used, 1.00)
-
-    base_stress = (
-        0.30 * soil_dryness +
-        0.15 * high_temperature +
-        0.12 * low_humidity +
-        0.15 * low_rainfall +
-        0.08 * high_sunlight +
-        0.05 * high_wind +
-        0.05 * high_ec +
-        0.05 * low_previous_irrigation +
-        0.05 * soil_weight
-    )
-
-    stress_index = (
-        base_stress
-        * (0.80 + 0.20 * crop_weight)
-        * (0.85 + 0.15 * stage_weight)
-        * mulch_factor
-        * 100
-    )
-
-    stress_index = max(0, min(stress_index, 100))
-
-    return round(stress_index, 2)
-
-
+# ==================================================
+# MODELES PYDANTIC (schemas des requetes)
+# ==================================================
 class IrrigationInput(BaseModel):
     Soil_Type: str
     Soil_pH: float
@@ -144,9 +73,9 @@ class IrrigationInput(BaseModel):
     Previous_Irrigation_mm: float
     Region: str
     Stress_Index: float
-  
+
+
 class IrrigationWithWeatherInput(BaseModel):
-    
     Soil_Type: str
     Soil_pH: float
     Soil_Moisture: float
@@ -160,47 +89,15 @@ class IrrigationWithWeatherInput(BaseModel):
     Previous_Irrigation_mm: float
     Region: str
 
-    
 
-
-
-
-
-
-def get_weather_from_open_meteo(latitude: float, longitude: float):
-    url = "https://api.open-meteo.com/v1/forecast"
-
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "current": "temperature_2m,relative_humidity_2m,rain,wind_speed_10m,sunshine_duration",
-        "wind_speed_unit": "kmh"
-    }
-
-    response = requests.get(url, params=params, timeout=10)
-    response.raise_for_status()
-
-    data = response.json()
-    current = data["current"]
-
-    weather_data = {
-        "Temperature_C": current.get("temperature_2m", 0),
-        "Humidity": current.get("relative_humidity_2m", 0),
-        "Rainfall_mm": current.get("rain", 0),
-        "Wind_Speed_kmh": current.get("wind_speed_10m", 0),
-        "Sunlight_Hours": current.get("sunshine_duration", 0) / 3600
-    }
-
-    return weather_data
-
-
-
-
+# ==================================================
+# ROUTES DE BASE
+# ==================================================
 @app.get("/")
 def home():
     return {
         "message": "Bienvenue dans l'API Smart-Agri",
-        "objectif": "Prédire l'humidité du sol au jour suivant."
+        "objectif": "Predire l'humidite du sol au jour suivant et recommander une irrigation.",
     }
 
 
@@ -208,89 +105,70 @@ def home():
 def health_check():
     return {
         "status": "API is running",
-        "model": "rf_pipeline.pkl loaded successfully"
+        "model": "rf_pipeline.pkl loaded successfully",
     }
 
 
+# ==================================================
+# PREDICTION SIMPLE (donnees meteo fournies manuellement)
+# ==================================================
 @app.post("/predict")
 def predict(data: IrrigationInput):
     input_data = pd.DataFrame([data.model_dump()])
-
     prediction = pipeline.predict(input_data)[0]
 
     return {
         "Soil_Moisture_J1_prediction": round(float(prediction), 2),
         "unit": "%",
-        "message": "Prédiction effectuée avec succès."
+        "message": "Prediction effectuee avec succes.",
     }
 
 
-
+# ==================================================
+# PREDICTION AVEC METEO AUTOMATIQUE (Open-Meteo)
+# ==================================================
 @app.post("/predict-with-weather")
 def predict_with_weather(data: IrrigationWithWeatherInput):
+    try:
+        return run_prediction_with_weather(data.model_dump())
+    except ValueError as error:
+        # Region non supportee
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Erreur de prediction : {error}")
 
-    if data.Region not in REGION_COORDINATES:
+
+# ==================================================
+# ANALYSE COMPLETE (workflow agentique LangGraph + Groq)
+# ==================================================
+@app.post("/analyze")
+def analyze(data: IrrigationWithWeatherInput):
+    """
+    Endpoint principal utilise par le frontend Streamlit.
+
+    Il execute le workflow LangGraph complet :
+    1. prediction ML + meteo (via core.prediction_service, appel direct,
+       pas de HTTP) ;
+    2. analyse meteorologique ;
+    3. analyse agronomique ;
+    4. decision d'irrigation ;
+    5. recommandation finale generee par Groq.
+    """
+    # Import local pour eviter tout probleme d'ordre d'import au demarrage
+    # (l'agent charge sa cle Groq via load_dotenv() a l'import).
+    from agent.langgraph_agent import run_smart_agri_analysis
+
+    try:
+        result = run_smart_agri_analysis(data.model_dump())
+    except Exception as error:
         raise HTTPException(
-            status_code=400,
-            detail=f"Region '{data.Region}' non supportée. Régions disponibles : {list(REGION_COORDINATES.keys())}"
+            status_code=500,
+            detail=f"Erreur lors de l'analyse agentique : {error}",
         )
 
-    coordinates = REGION_COORDINATES[data.Region]
+    if not result.get("success", False):
+        # On ne leve pas d'exception HTTP ici : le frontend affichera
+        # proprement le message d'erreur contenu dans la reponse.
+        return result
 
-    weather_data = get_weather_from_open_meteo(
-        latitude=coordinates["latitude"],
-        longitude=coordinates["longitude"]
-    )
-     
-
-    stress_index = calculate_stress_index(
-       soil_moisture=data.Soil_Moisture,
-       temperature_c=weather_data["Temperature_C"],
-       humidity=weather_data["Humidity"],
-       rainfall_mm=weather_data["Rainfall_mm"],
-       sunlight_hours=weather_data["Sunlight_Hours"],
-       wind_speed_kmh=weather_data["Wind_Speed_kmh"],
-       electrical_conductivity=data.Electrical_Conductivity,
-       previous_irrigation_mm=data.Previous_Irrigation_mm,
-       soil_type=data.Soil_Type,
-      crop_type=data.Crop_Type,
-       crop_growth_stage=data.Crop_Growth_Stage,
-       mulching_used=data.Mulching_Used
-    )
-
-    input_data = {
-        "Soil_Type": data.Soil_Type,
-        "Soil_pH": data.Soil_pH,
-        "Soil_Moisture": data.Soil_Moisture,
-        "Organic_Carbon": data.Organic_Carbon,
-        "Electrical_Conductivity": data.Electrical_Conductivity,
-
-        "Temperature_C": weather_data["Temperature_C"],
-        "Humidity": weather_data["Humidity"],
-        "Rainfall_mm": weather_data["Rainfall_mm"],
-        "Sunlight_Hours": weather_data["Sunlight_Hours"],
-        "Wind_Speed_kmh": weather_data["Wind_Speed_kmh"],
-
-        "Crop_Type": data.Crop_Type,
-        "Crop_Growth_Stage": data.Crop_Growth_Stage,
-        "Season": data.Season,
-        "Mulching_Used": data.Mulching_Used,
-        "Previous_Irrigation_mm": data.Previous_Irrigation_mm,
-        "Region": data.Region,
-        "Stress_Index": stress_index
-    }
-
-    input_df = pd.DataFrame([input_data])
-
-    prediction = pipeline.predict(input_df)[0]
-
-    return {
-        "weather_source": "Open-Meteo",
-        "region": data.Region,
-        "coordinates_used": coordinates,
-        "weather_data_used": weather_data,
-        "calculated_stress_index": stress_index,
-        "Soil_Moisture_J1_prediction": round(float(prediction), 2),
-        "unit": "%",
-        "message": "Prédiction effectuée avec les données météo Open-Meteo."
-    }
+    return result
